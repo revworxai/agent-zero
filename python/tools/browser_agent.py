@@ -32,16 +32,24 @@ class State:
 
     def __del__(self):
         self.kill_task()
-        files.delete_dir(self.get_user_data_dir()) # cleanup user data dir
+        # files.delete_dir(self.get_user_data_dir()) # cleanup user data dir - disabled to persist CRM session cookies
 
     def get_user_data_dir(self):
-        return str(
-            Path.home()
-            / ".config"
-            / "browseruse"
-            / "profiles"
-            / f"agent_{self.agent.context.id}"
-        )
+        """Returns the user data directory path for Chromium.
+        Uses __file__ to detect project root — works correctly on both Mac (server host)
+        and Docker (where /a0/ is read-only from Mac perspective).
+        Example:
+          Mac:    /Users/dalesmith/.../agent-zero/tmp/browseruse_profiles/agent_{id}
+          Docker: /a0/tmp/browseruse_profiles/agent_{id}
+        Both point to the same physical directory via volume mount."""
+        from pathlib import Path as _Path
+        import os as _os
+        # browser_agent.py is at {project_root}/python/tools/browser_agent.py
+        project_root = _Path(__file__).resolve().parent.parent.parent
+        profile_name = f"agent_{self.agent.context.id}"
+        udd = project_root / 'tmp' / 'browseruse_profiles' / profile_name
+        udd.mkdir(parents=True, exist_ok=True)
+        return str(udd)
 
     async def _initialize(self):
         if self.browser_session:
@@ -49,10 +57,37 @@ class State:
 
         # for some reason we need to provide exact path to headless shell, otherwise it looks for headed browser
         pw_binary = ensure_playwright_binary()
+        # DEBUG: Log which binary and args are being used
+        import os as _os
+        _debug_log = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', '..', 'tmp', 'browser_ainvoke_debug.log')
+        with open(_debug_log, 'a') as _dbg:
+            _dbg.write(f"\n=== BROWSER SESSION INIT ===\n")
+            _dbg.write(f"pw_binary: {pw_binary}\n")
+            _dbg.write(f"binary exists: {_os.path.exists(str(pw_binary))}\n")
+            _udd_info = self.get_user_data_dir()
+            _dbg.write("user_data_dir to Chromium: " + _udd_info + chr(10))
                 
+        # Write Chromium Preferences to disable Save Password dialog
+        # This is more reliable than command-line flags alone
+        import json as _json
+        _udd = self.get_user_data_dir()  # Same path works for both Docker file ops and Chromium
+        _prefs_dir = _os.path.join(_udd, 'Default')
+        _os.makedirs(_prefs_dir, exist_ok=True)
+        _prefs_file = _os.path.join(_prefs_dir, 'Preferences')
+        _prefs = {
+            "credentials_enable_service": False,
+            "credentials_enable_autosign_in": False,
+            "profile": {
+                "password_manager_enabled": False
+            }
+        }
+        if not _os.path.exists(_prefs_file):
+            with open(_prefs_file, 'w') as _pf:
+                _json.dump(_prefs, _pf)
+
         self.browser_session = browser_use.BrowserSession(
             browser_profile=browser_use.BrowserProfile(
-                headless=True,
+                headless=False,
                 disable_security=True,
                 chromium_sandbox=False,
                 accept_downloads=True,
@@ -60,21 +95,49 @@ class State:
                 allowed_domains=["*", "http://*", "https://*"],
                 executable_path=pw_binary,
                 keep_alive=True,
-                minimum_wait_page_load_time=1.0,
-                wait_for_network_idle_page_load_time=2.0,
-                maximum_wait_page_load_time=10.0,
-                window_size={"width": 1024, "height": 2048},
-                screen={"width": 1024, "height": 2048},
-                viewport={"width": 1024, "height": 2048},
-                no_viewport=False,
-                args=["--headless=new"],
+                minimum_wait_page_load_time=0.3,
+                wait_for_network_idle_page_load_time=0.8,
+                maximum_wait_page_load_time=5.0,
+                window_size={"width": 1920, "height": 900},
+                screen={"width": 1920, "height": 1080},
+                no_viewport=True,
+                timezone_id='America/Belize',  # Match account TZ to prevent CRM timezone modal
+                args=["--remote-debugging-port=9222", "--disable-save-password-bubble", "--disable-features=PasswordManagerEnabled"],
                 # Use a unique user data directory to avoid conflicts
                 user_data_dir=self.get_user_data_dir(),
+                # storage_state enables StorageStateWatchdog to save/load cookies
+                # auto-saves every 30s and on cookie changes -> persistent login
+                # storage_state removed: conflicts with user_data_dir causing StorageStateWatchdog issues
                 extra_http_headers=self.agent.config.browser_http_headers or {},
                 )
         )
 
-        await self.browser_session.start() if self.browser_session else None
+        try:
+            await self.browser_session.start() if self.browser_session else None
+            # After session starts, ensure rememberedTZ cookie is always set correctly
+            # This prevents the timezone modal from appearing on every session
+            try:
+                if self.browser_session and self.browser_session.cdp_client:
+                    await self.browser_session._cdp_set_cookies([{
+                        'name': 'rememberedTZ',
+                        'value': 'America/Belize',
+                        'domain': 'app.revworx.ai',
+                        'path': '/app2',
+                        'secure': True,
+                        'httpOnly': False,
+                        'sameSite': 'None',
+                        'expires': 1806539467
+                    }])
+            except Exception as _tz_err:
+                pass  # Non-critical — timezone modal may appear but login still works
+        except Exception as _start_err:
+            import traceback as _tb
+            _err_msg = str(_start_err)
+            _err_tb = _tb.format_exc()
+            with open(_debug_log, 'a') as _dbg:
+                _dbg.write("BrowserSession.start() ERROR: " + _err_msg + chr(10))
+                _dbg.write(_err_tb)
+            raise
         # self.override_hooks()
 
         # --------------------------------------------------------------------------
@@ -84,20 +147,32 @@ class State:
         # aspect ratio. We fix this by directly setting viewport size after startup.
         # --------------------------------------------------------------------------
 
-        if self.browser_session:
-            try:
-                page = await self.browser_session.get_current_page()
-                if page:
-                    await page.set_viewport_size({"width": 1024, "height": 2048})
-            except Exception as e:
-                PrintStyle().warning(f"Could not force set viewport size: {e}")
+        # Viewport patch disabled — no_viewport=True allows page to adapt to window size naturally
+        # if self.browser_session:
+        #     try:
+        #         page = await self.browser_session.get_current_page()
+        #         if page:
+        #             await page.set_viewport_size({"width": 1920, "height": 900})
+        #     except Exception as e:
+        #         PrintStyle().warning(f"Could not force set viewport size: {e}")
 
         # --------------------------------------------------------------------------    
         
         # Add init script to the browser session
-        if self.browser_session and self.browser_session.browser_context:
-            js_override = files.get_abs_path("lib/browser/init_override.js")
-            await self.browser_session.browser_context.add_init_script(path=js_override) if self.browser_session else None
+        # Supports both old API (browser_context) and new CDP-based API (0.11+)
+        if self.browser_session:
+            try:
+                js_override = files.get_abs_path("lib/browser/init_override.js")
+                if getattr(self.browser_session, "browser_context", None):
+                    # Old API (browser-use < 0.11)
+                    await self.browser_session.browser_context.add_init_script(path=js_override)
+                elif hasattr(self.browser_session, "_cdp_add_init_script"):
+                    # New CDP-based API (browser-use 0.11+)
+                    with open(js_override, "r") as f:
+                        script_content = f.read()
+                    await self.browser_session._cdp_add_init_script(script_content)
+            except Exception as e:
+                PrintStyle().warning(f"Could not add init script: {e}")
 
     def start_task(self, task: str):
         if self.task and self.task.is_alive():
@@ -110,6 +185,17 @@ class State:
             self.agent.context.task.add_child_task(self.task, terminate_thread=True)
         self.task.start_task(self._run_task, task) if self.task else None
         return self.task
+
+    def kill_task_only(self):
+        """Stops current browser task but PRESERVES the browser session.
+        The Chromium window stays open and can be reused for the next task.
+        Use this instead of kill_task() when reset=True to avoid spawning new windows."""
+        if self.task:
+            self.task.kill(terminate_thread=True)
+            self.task = None
+        self.use_agent = None
+        self.iter_no = 0
+        # browser_session intentionally NOT closed — window stays alive
 
     def kill_task(self):
         if self.task:
@@ -167,7 +253,8 @@ class State:
                 controller=controller,
                 enable_memory=False,  # Disable memory to avoid state conflicts
                 llm_timeout=3000, # TODO rem
-                sensitive_data=cast(dict[str, str | dict[str, str]] | None, secrets_dict or {}),  # Pass secrets
+                # TEMPORARILY DISABLED FOR TESTING
+                # sensitive_data=cast(dict[str, str | dict[str, str]] | None, secrets_dict or {}),  # Pass secrets
             )
         except Exception as e:
             raise Exception(
@@ -185,7 +272,7 @@ class State:
         result = None
         if self.use_agent:
             result = await self.use_agent.run(
-                max_steps=50, on_step_start=hook, on_step_end=hook
+                max_steps=20, on_step_start=hook, on_step_end=hook
             )
         return result
 
@@ -216,7 +303,8 @@ class BrowserAgent(Tool):
         self.guid = self.agent.context.generate_id() # short random id
         reset = str(reset).lower().strip() == "true"
         await self.prepare_state(reset=reset)
-        message = get_secrets_manager(self.agent.context).mask_values(message, placeholder="<secret>{key}</secret>") # mask any potential passwords passed from A0 to browser-use to browser-use format
+        # TEMPORARILY DISABLED FOR TESTING - masking caused LLM format errors with sensitive_data
+        # message = get_secrets_manager(self.agent.context).mask_values(message, placeholder="<secret>{key}</secret>") # mask any potential passwords passed from A0 to browser-use to browser-use format
         task = self.state.start_task(message) if self.state else None
 
         # wait for browser agent to finish and update progress with timeout
@@ -377,8 +465,11 @@ class BrowserAgent(Tool):
     async def prepare_state(self, reset=False):
         self.state = self.agent.get_data("_browser_agent_state")
         if reset and self.state:
-            self.state.kill_task()
-        if not self.state or reset:
+            # Kill task only — preserve browser session to avoid spawning new windows
+            # The existing Chromium window stays open and is reused for the next task
+            self.state.kill_task_only()
+        if not self.state:
+            # Only create new State if none exists (not on reset — reuse existing)
             self.state = await State.create(self.agent)
         self.agent.set_data("_browser_agent_state", self.state)
 

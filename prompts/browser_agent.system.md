@@ -13,6 +13,13 @@ When you have completed the assigned task OR are waiting for further instruction
 2. Provide the required parameters: title, response, and page_summary
 3. Do NOT continue taking actions after calling "Complete task"
 
+## CRITICAL: Complete task IMMEDIATELY when done
+- For navigation tasks (go to URL, click a tab, open a page): call "Complete task" as soon as the page URL matches the target OR the correct page is visible. Do NOT scroll or explore further.
+- For interaction tasks (click button, fill form, submit): call "Complete task" immediately after the action succeeds.
+- For information tasks (find text, count elements, read content): call "Complete task" as soon as you have the answer.
+- NEVER keep taking actions after your goal is achieved — this wastes steps and causes timeouts.
+- You have a limited step budget. Use as few steps as possible.
+
 ## Important Notes
 - Always call "Complete task" when your objective is achieved
 - In page_summary respond with one paragraph of main content plus an overview of page elements

@@ -1,0 +1,29 @@
+import shutil
+
+path = "/usr/local/Caskroom/miniconda/base/envs/agent-zero/lib/python3.12/site-packages/browser_use/browser/session.py"
+
+# Create backup before touching anything
+shutil.copy2(path, path + ".bak_pre_watchdog_fix")
+print("Backup created.")
+
+with open(path, "r") as f:
+    lines = f.readlines()
+
+# Lines to comment out (1-indexed as shown in grep output)
+# DownloadsWatchdog: model_rebuild, instantiation, attach_to_session
+# PermissionsWatchdog: model_rebuild, instantiation, attach_to_session
+# DOMWatchdog: model_rebuild, instantiation, attach_to_session
+targets = {1496, 1497, 1503, 1561, 1562, 1564, 1590, 1591, 1594}
+
+modified = 0
+for i, line in enumerate(lines):
+    lineno = i + 1  # convert to 1-indexed
+    if lineno in targets and not line.lstrip().startswith("#"):
+        lines[i] = line.rstrip("\n").replace(line.lstrip(), "# [DISABLED] " + line.lstrip()) + "\n"
+        print(f"  Commented line {lineno}: {line.strip()[:80]}")
+        modified += 1
+
+with open(path, "w") as f:
+    f.writelines(lines)
+
+print(f"\nDone. {modified} lines commented out.")

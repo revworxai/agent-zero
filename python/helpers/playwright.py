@@ -9,12 +9,34 @@ from python.helpers import files
 # this helper ensures that playwright is installed in /lib/playwright
 # should work for both docker and local installation
 
-def get_playwright_binary():
+def get_playwright_binary(prefer_full=True):
+    """Find the Playwright Chromium binary.
+
+    prefer_full=True (default): Prefer full Chromium over headless-shell.
+      Full Chromium supports CDP remote debugging and headed mode.
+    prefer_full=False: Prefer headless-shell (faster, smaller).
+    """
     pw_cache = Path(get_playwright_cache_dir())
-    for pattern in (
+
+    # Full Chromium patterns (supports CDP remote debugging + headed mode)
+    full_chromium_patterns = (
+        "chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+        "chromium-*/chrome-win/chrome.exe",
+        "chromium-*/chrome-linux/chrome",
+    )
+
+    # Headless shell patterns (lighter, no CDP/headed support)
+    headless_shell_patterns = (
         "chromium_headless_shell-*/chrome-*/headless_shell",
         "chromium_headless_shell-*/chrome-*/headless_shell.exe",
-    ):
+    )
+
+    if prefer_full:
+        search_order = list(full_chromium_patterns) + list(headless_shell_patterns)
+    else:
+        search_order = list(headless_shell_patterns) + list(full_chromium_patterns)
+
+    for pattern in search_order:
         binary = next(pw_cache.glob(pattern), None)
         if binary:
             return binary

@@ -591,6 +591,9 @@ class AsyncAIChatReplacement:
 
 
 from browser_use.llm import ChatOllama, ChatOpenRouter, ChatGoogle, ChatAnthropic, ChatGroq, ChatOpenAI
+from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
+from browser_use.llm.schema import SchemaOptimizer
+from browser_use.llm.openrouter.serializer import OpenRouterMessageSerializer as BrowserUseSerializer
 
 class BrowserCompatibleChatWrapper(ChatOpenRouter):
     """
@@ -666,6 +669,150 @@ class BrowserCompatibleChatWrapper(ChatOpenRouter):
             pass
 
         return resp
+
+
+    async def ainvoke(
+        self,
+        messages,
+        output_format=None,
+        **kwargs,
+    ):
+        """
+        browser-use 0.11.12 compatible ainvoke implementation.
+        Converts browser_use messages to LiteLLM format and calls acompletion.
+        Returns ChatInvokeCompletion as expected by browser-use 0.11.12.
+        """
+        import json
+        import traceback
+
+        # DEBUG: Log ainvoke calls
+        try:
+            import os
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp', 'browser_ainvoke_debug.log'), 'a') as _dbg:
+                _dbg.write(f"\n=== ainvoke called ===\n")
+                _dbg.write(f"model: {self._wrapper.model_name}\n")
+                _dbg.write(f"output_format: {output_format}\n")
+                _dbg.write(f"messages count: {len(messages)}\n")
+        except Exception as _de:
+            pass
+
+        # Apply rate limiting
+        apply_rate_limiter_sync(self._wrapper.a0_model_conf, str(messages))
+
+        # Serialize browser_use messages to OpenAI-compatible dict format
+        serialized_messages = BrowserUseSerializer.serialize_messages(messages)
+
+        # Build kwargs from wrapper config
+        kwrgs = {**self._wrapper.kwargs}
+
+        try:
+            if output_format is None:
+                # Plain string response
+                resp = await acompletion(
+                    model=self._wrapper.model_name,
+                    messages=serialized_messages,
+                    **kwrgs,
+                )
+                content = resp.choices[0].message.content or ''
+                usage = self._build_usage(resp)
+                return ChatInvokeCompletion(completion=content, usage=usage)
+            else:
+                # Structured output: use json_object mode (avoids Anthropic beta headers
+                # and schema constraint issues with older LiteLLM versions)
+                # Build schema description to include in system message
+                schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+                import json as _json
+                schema_str = _json.dumps(schema, indent=2)
+
+                # Append JSON schema instruction to last user message
+                augmented_messages = list(serialized_messages)
+                schema_instruction = (
+                    f"\n\nIMPORTANT: You MUST respond with a valid JSON object matching this schema exactly:\n"
+                    f"```json\n{schema_str}\n```\n"
+                    f"Respond ONLY with the JSON object, no other text."
+                )
+                # Add to last user message or append new one
+                if augmented_messages and augmented_messages[-1].get('role') == 'user':
+                    last = dict(augmented_messages[-1])
+                    if isinstance(last.get('content'), str):
+                        last['content'] = last['content'] + schema_instruction
+                    elif isinstance(last.get('content'), list):
+                        # find text part
+                        for part in last['content']:
+                            if isinstance(part, dict) and part.get('type') == 'text':
+                                part['text'] = part['text'] + schema_instruction
+                                break
+                    augmented_messages[-1] = last
+                else:
+                    augmented_messages.append({'role': 'user', 'content': schema_instruction})
+
+                resp = await acompletion(
+                    model=self._wrapper.model_name,
+                    messages=augmented_messages,
+                    response_format={'type': 'json_object'},
+                    **kwrgs,
+                )
+
+                raw_content = resp.choices[0].message.content or '{}'
+
+                # Attempt dirty_json cleanup if needed
+                try:
+                    if not raw_content.strip().startswith('{'):
+                        parsed = dirty_json.parse(raw_content)
+                        raw_content = dirty_json.stringify(parsed)
+                except Exception:
+                    pass
+
+                # Parse structured output
+                try:
+                    parsed_obj = output_format.model_validate_json(raw_content)
+                except Exception:
+                    try:
+                        d = json.loads(raw_content)
+                        parsed_obj = output_format.model_validate(d)
+                    except Exception:
+                        d = dirty_json.parse(raw_content)
+                        parsed_obj = output_format.model_validate(d)
+
+                usage = self._build_usage(resp)
+                return ChatInvokeCompletion(completion=parsed_obj, usage=usage)
+
+        except Exception as e:
+            # DEBUG: Log exception
+            try:
+                import os, traceback
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp', 'browser_ainvoke_debug.log'), 'a') as _dbg:
+                    _dbg.write(f"\n!!! ainvoke EXCEPTION: {type(e).__name__}: {e}\n")
+                    _dbg.write(traceback.format_exc())
+            except Exception:
+                pass
+            raise e
+
+    def _build_usage(self, resp) -> ChatInvokeUsage:
+        """Build ChatInvokeUsage from LiteLLM response."""
+        try:
+            u = resp.usage
+            return ChatInvokeUsage(
+                prompt_tokens=getattr(u, 'prompt_tokens', 0) or 0,
+                prompt_cached_tokens=(
+                    getattr(u.prompt_tokens_details, 'cached_tokens', None)
+                    if getattr(u, 'prompt_tokens_details', None) else None
+                ),
+                prompt_cache_creation_tokens=None,
+                prompt_image_tokens=None,
+                completion_tokens=getattr(u, 'completion_tokens', 0) or 0,
+                total_tokens=getattr(u, 'total_tokens', 0) or 0,
+            )
+        except Exception:
+            return ChatInvokeUsage(
+                prompt_tokens=0,
+                prompt_cached_tokens=None,
+                prompt_cache_creation_tokens=None,
+                prompt_image_tokens=None,
+                completion_tokens=0,
+                total_tokens=0,
+            )
+
 
 class LiteLLMEmbeddingWrapper(Embeddings):
     model_name: str

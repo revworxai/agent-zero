@@ -272,7 +272,10 @@ class MicrophoneInput {
         } finally {
             URL.revokeObjectURL(audioUrl);
             this.audioChunks = [];
-            this.status = Status.LISTENING;
+            // Fix: Only resume listening if mic wasn't toggled off during processing (Issue 30)
+            if (this.status !== Status.INACTIVE) {
+                this.status = Status.LISTENING;
+            }
         }
     }
 
